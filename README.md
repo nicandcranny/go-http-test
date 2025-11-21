@@ -84,6 +84,10 @@ func TestExample(t *testing.T) {
 
 	// Reset the call counters back to 0
 	server.ResetNCalls()
+
+	// We can also get the call and assert here.
+	call := server.GetCalls(http.MethodPost, path)[0]
+	assert.Equal(t, "1d", call.Params["1d"])
 }
 ```
 
