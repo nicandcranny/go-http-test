@@ -38,3 +38,40 @@ func (r *ResponseWriter) SetStatusCode(statusCode int) {
 func (r *ResponseWriter) Header() http.Header {
 	return r.w.Header()
 }
+
+// JSON sends a JSON response with status code.
+func (r *ResponseWriter) JSON(code int, i any) error {
+	r.w.Header().Set("Content-Type", "application/json")
+	r.w.WriteHeader(code)
+	return json.NewEncoder(r.w).Encode(i)
+}
+
+// HTML sends an HTML response with status code.
+func (r *ResponseWriter) HTML(code int, html string) error {
+	r.w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	r.w.WriteHeader(code)
+	_, err := r.w.Write([]byte(html))
+	return err
+}
+
+// String sends a string response with status code.
+func (r *ResponseWriter) String(code int, s string) error {
+	r.w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	r.w.WriteHeader(code)
+	_, err := r.w.Write([]byte(s))
+	return err
+}
+
+// Blob sends a blob response with status code and content type.
+func (r *ResponseWriter) Blob(code int, contentType string, b []byte) error {
+	r.w.Header().Set("Content-Type", contentType)
+	r.w.WriteHeader(code)
+	_, err := r.w.Write(b)
+	return err
+}
+
+// NoContent sends a response with no body and a status code.
+func (r *ResponseWriter) NoContent(code int) error {
+	r.w.WriteHeader(code)
+	return nil
+}

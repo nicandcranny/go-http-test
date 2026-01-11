@@ -42,7 +42,9 @@ import (
 
 func TestExample(t *testing.T) {
 	// Start a new HTTP server using go-http-test
-	server, err := httptest.NewServer("localhost:8080", httptest.ServerConfig{})
+	server, err := httptest.NewServer("localhost:8080", httptest.ServerConfig{
+		EnableLogging: true, // To enable logging
+	})
 	assert.NoError(t, err)
 	defer server.Close()
 
@@ -66,12 +68,18 @@ func TestExample(t *testing.T) {
 		assert.Equal(t, "abcd", reqBody["abcd"])
 
 		// You can also generate different response body based on the request body
+		w.Header().Set("Content-Type", "application/json")
+		w.SetStatusCode(http.StatusOK)
 		w.SetBodyJSON(resStruct{
 			Abcd: reqBody["abcd"],
 			Efgh: 1,
 		})
-		w.Header().Set("Content-Type", "application/json")
-		w.SetStatusCode(http.StatusOK)
+
+		// Or you can also send using this method to simplify the code
+		w.JSON(http.StatusOK, resStruct{
+			Abcd: reqBody["abcd"],
+			Efgh: 1,
+		})
 	})
 
 	// Test doing a GET request to the path

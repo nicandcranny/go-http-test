@@ -348,3 +348,55 @@ func (s *serverTestSuite) TestServerWithLogging() {
 	s.NoError(err)
 	s.Equal(http.StatusOK, res.StatusCode)
 }
+
+func (s *serverTestSuite) TestResponseWriter_NewMethods() {
+	server, err := httptest.NewServer(address, httptest.ServerConfig{})
+	s.NoError(err)
+	defer server.Close()
+
+	// Test JSON
+	server.RegisterHandler(http.MethodGet, "/json", func(w httptest.ResponseWriter, r *httptest.Request) {
+		w.JSON(http.StatusOK, map[string]string{"foo": "bar"})
+	})
+
+	// Test HTML
+	server.RegisterHandler(http.MethodGet, "/html", func(w httptest.ResponseWriter, r *httptest.Request) {
+		w.HTML(http.StatusOK, "<h1>Hello</h1>")
+	})
+
+	// Test String
+	server.RegisterHandler(http.MethodGet, "/string", func(w httptest.ResponseWriter, r *httptest.Request) {
+		w.String(http.StatusOK, "Hello World")
+	})
+
+	// Test NoContent
+	server.RegisterHandler(http.MethodGet, "/nocontent", func(w httptest.ResponseWriter, r *httptest.Request) {
+		w.NoContent(http.StatusNoContent)
+	})
+
+	// Verify JSON
+	res, resBody, err := s.httpClient.Do(ctx, http.MethodGet, "/json", nil, nil, nil)
+	s.NoError(err)
+	s.Equal(http.StatusOK, res.StatusCode)
+	s.Equal("application/json", res.Header.Get("Content-Type"))
+	s.JSONEq(`{"foo":"bar"}`, string(resBody))
+
+	// Verify HTML
+	res, resBody, err = s.httpClient.Do(ctx, http.MethodGet, "/html", nil, nil, nil)
+	s.NoError(err)
+	s.Equal(http.StatusOK, res.StatusCode)
+	s.Contains(res.Header.Get("Content-Type"), "text/html")
+	s.Equal("<h1>Hello</h1>", string(resBody))
+
+	// Verify String
+	res, resBody, err = s.httpClient.Do(ctx, http.MethodGet, "/string", nil, nil, nil)
+	s.NoError(err)
+	s.Equal(http.StatusOK, res.StatusCode)
+	s.Contains(res.Header.Get("Content-Type"), "text/plain")
+	s.Equal("Hello World", string(resBody))
+
+	// Verify NoContent
+	res, _, err = s.httpClient.Do(ctx, http.MethodGet, "/nocontent", nil, nil, nil)
+	s.NoError(err)
+	s.Equal(http.StatusNoContent, res.StatusCode)
+}
