@@ -10,13 +10,13 @@ import (
 	"net/url"
 	"sync"
 
-	"github.com/gin-gonic/gin"
+	"github.com/labstack/echo/v4"
 )
 
 // Server is a mock http server for testing.
 type Server struct {
 	httpServer *http.Server
-	engine     *gin.Engine
+	engine     *echo.Echo
 	// nCalls store map[method][path]count
 	nCalls map[string]map[string]int
 	// routes store map[method][path]handler
@@ -48,24 +48,23 @@ type ServerConfig struct {
 // NewServer creates and starts new http test server.
 // address is the address to listen on, e.g. "localhost:3001".
 func NewServer(address string, config ServerConfig) (*Server, error) {
-	// Set gin to release mode to avoid unnecessary logs.
-	gin.SetMode(gin.ReleaseMode)
-
 	// Start listener first to make sure the address is available.
 	l, err := net.Listen("tcp", address)
 	if err != nil {
 		return nil, fmt.Errorf("net.Listen: %w", err)
 	}
 
-	r := gin.Default()
+	e := echo.New()
+	e.HideBanner = true
+	e.HidePort = true
 
 	httpServer := &http.Server{
 		Addr:    address,
-		Handler: r.Handler(),
+		Handler: e,
 	}
 
 	server := &Server{
-		engine:     r,
+		engine:     e,
 		httpServer: httpServer,
 		nCalls:     map[string]map[string]int{},
 		routes:     map[string]map[string]ServerHandlerFunc{},
@@ -119,10 +118,15 @@ func (s *Server) ResetCalls() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	s.ResetNCalls()
 	for path := range s.calls {
 		for method := range s.calls[path] {
 			s.calls[path][method] = []RequestMade{}
+		}
+	}
+	// Reset NCalls too. We can't call ResetNCalls() here because it will try to acquire the lock too and cause a deadlock.
+	for path := range s.nCalls {
+		for method := range s.nCalls[path] {
+			s.nCalls[path][method] = 0
 		}
 	}
 }
@@ -143,33 +147,22 @@ func (s *Server) RegisterHandler(method string, path string, handler ServerHandl
 		s.calls[method] = map[string][]RequestMade{}
 	}
 
-	if s.routes[method] != nil && s.routes[method][path] != nil {
-		// Regenerate the handler and re-register all handlers.
-		s.engine = gin.Default()
-		for m, p := range s.routes {
-			for k, v := range p {
-				// Skip same one, we'll register it below.
-				if m == method && k == path {
-					continue
-				}
-				s.engine.Handle(m, k, func(c *gin.Context) {
-					s.incrNCalls(m, k)
-					s.storeCall(m, k, c)
-					v(ResponseWriter{w: c.Writer}, &Request{Request: c.Request, Params: Params{ginContext: c}})
-				})
-			}
-		}
-		s.httpServer.Handler = s.engine.Handler()
-	}
+	_, alreadyRegistered := s.routes[method][path]
 	s.routes[method][path] = handler
 
-	s.engine.Handle(method, path, func(c *gin.Context) {
-		s.incrNCalls(method, path)
-		s.storeCall(method, path, c)
-		handler(ResponseWriter{w: c.Writer}, &Request{Request: c.Request, Params: Params{ginContext: c}})
-	})
+	if !alreadyRegistered {
+		s.engine.Add(method, path, func(c echo.Context) error {
+			s.incrNCalls(method, path)
+			s.storeCall(method, path, c)
 
-	s.httpServer.Handler = s.engine.Handler()
+			s.mu.Lock()
+			currHandler := s.routes[method][path]
+			s.mu.Unlock()
+
+			currHandler(ResponseWriter{w: c.Response().Writer}, &Request{Request: c.Request(), Params: Params{echoContext: c}})
+			return nil
+		})
+	}
 }
 
 // incrNCalls increments the number of nCalls for a path.
@@ -181,31 +174,36 @@ func (s *Server) incrNCalls(method, path string) {
 }
 
 // storeCall stores the call for a path.
-func (s *Server) storeCall(method, path string, c *gin.Context) {
+func (s *Server) storeCall(method, path string, c echo.Context) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	// If body is not empty, read it into byte.
 	var body []byte
-	if c.Request.Body != nil {
-		body, _ = io.ReadAll(c.Request.Body)
+	if c.Request().Body != nil {
+		body, _ = io.ReadAll(c.Request().Body)
 		// Restore the body.
-		c.Request.Body = io.NopCloser(bytes.NewBuffer(body))
+		c.Request().Body = io.NopCloser(bytes.NewBuffer(body))
 	}
 
 	s.calls[method][path] = append(s.calls[method][path], RequestMade{
 		Body:    body,
-		Headers: c.Request.Header,
-		Query:   c.Request.URL.Query(),
+		Headers: c.Request().Header,
+		Query:   c.QueryParams(),
 		Params:  s.getAllParams(c),
 	})
 }
 
-func (s *Server) getAllParams(c *gin.Context) map[string]string {
+func (s *Server) getAllParams(c echo.Context) map[string]string {
 	params := make(map[string]string)
 
-	for _, param := range c.Params {
-		params[param.Key] = param.Value
+	names := c.ParamNames()
+	values := c.ParamValues()
+
+	for i, name := range names {
+		if i < len(values) {
+			params[name] = values[i]
+		}
 	}
 
 	return params
@@ -216,8 +214,11 @@ func (s *Server) ResetAll() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	s.engine = gin.Default()
-	s.httpServer.Handler = s.engine.Handler()
+	s.engine = echo.New()
+	s.engine.HideBanner = true
+	s.engine.HidePort = true
+	s.httpServer.Handler = s.engine
+
 	s.nCalls = map[string]map[string]int{}
 	s.routes = map[string]map[string]ServerHandlerFunc{}
 	s.calls = map[string]map[string][]RequestMade{}
