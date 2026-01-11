@@ -11,12 +11,14 @@ import (
 	"sync"
 
 	"github.com/labstack/echo/v4"
+	"github.com/labstack/echo/v4/middleware"
 )
 
 // Server is a mock http server for testing.
 type Server struct {
 	httpServer *http.Server
 	engine     *echo.Echo
+	config     ServerConfig
 	// nCalls store map[method][path]count
 	nCalls map[string]map[string]int
 	// routes store map[method][path]handler
@@ -42,7 +44,7 @@ type RequestMade struct {
 type ServerHandlerFunc func(w ResponseWriter, r *Request)
 
 type ServerConfig struct {
-	// Nothing here yet.
+	EnableLogging bool
 }
 
 // NewServer creates and starts new http test server.
@@ -58,6 +60,10 @@ func NewServer(address string, config ServerConfig) (*Server, error) {
 	e.HideBanner = true
 	e.HidePort = true
 
+	if config.EnableLogging {
+		e.Use(middleware.RequestLogger())
+	}
+
 	httpServer := &http.Server{
 		Addr:    address,
 		Handler: e,
@@ -65,6 +71,7 @@ func NewServer(address string, config ServerConfig) (*Server, error) {
 
 	server := &Server{
 		engine:     e,
+		config:     config,
 		httpServer: httpServer,
 		nCalls:     map[string]map[string]int{},
 		routes:     map[string]map[string]ServerHandlerFunc{},
@@ -217,6 +224,11 @@ func (s *Server) ResetAll() {
 	s.engine = echo.New()
 	s.engine.HideBanner = true
 	s.engine.HidePort = true
+
+	if s.config.EnableLogging {
+		s.engine.Use(middleware.RequestLogger())
+	}
+
 	s.httpServer.Handler = s.engine
 
 	s.nCalls = map[string]map[string]int{}

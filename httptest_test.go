@@ -11,8 +11,8 @@ import (
 
 	"github.com/stretchr/testify/suite"
 
-	httptest "github.com/slzhffktm/go-http-test"
-	"github.com/slzhffktm/go-http-test/internal/httpclient"
+	httptest "github.com/nicandcranny/go-http-test"
+	"github.com/nicandcranny/go-http-test/internal/httpclient"
 )
 
 const baseURL = "http://127.0.0.1:3010"
@@ -329,4 +329,22 @@ func (s *serverTestSuite) TestResetAll() {
 
 	s.Equal(0, server.GetNCalls(http.MethodGet, path))
 	s.Equal(0, len(server.GetCalls(http.MethodGet, path)))
+}
+
+func (s *serverTestSuite) TestServerWithLogging() {
+	server, err := httptest.NewServer(address, httptest.ServerConfig{
+		EnableLogging: true,
+	})
+	s.NoError(err)
+	defer server.Close()
+
+	path := "/log-path"
+	server.RegisterHandler(http.MethodGet, path, func(w httptest.ResponseWriter, r *httptest.Request) {
+		w.SetStatusCode(http.StatusOK)
+		w.SetBodyBytes([]byte("ok"))
+	})
+
+	res, _, err := s.httpClient.Do(ctx, http.MethodGet, path, nil, nil, nil)
+	s.NoError(err)
+	s.Equal(http.StatusOK, res.StatusCode)
 }

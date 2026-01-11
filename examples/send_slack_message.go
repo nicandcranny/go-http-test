@@ -11,7 +11,7 @@ import (
 
 	"github.com/joho/godotenv"
 
-	"github.com/slzhffktm/go-http-test/internal/httpclient"
+	"github.com/nicandcranny/go-http-test/internal/httpclient"
 )
 
 func init() {

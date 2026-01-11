@@ -9,8 +9,8 @@ import (
 	"strings"
 	"testing"
 
-	httptest "github.com/slzhffktm/go-http-test"
-	"github.com/slzhffktm/go-http-test/examples"
+	httptest "github.com/nicandcranny/go-http-test"
+	"github.com/nicandcranny/go-http-test/examples"
 
 	"github.com/stretchr/testify/suite"
 )

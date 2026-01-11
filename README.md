@@ -18,7 +18,7 @@ This library also supports path parameter using `/:pathparam`.
 To use go-http-test in your Go projects, you need to have Go (>=1.23) installed and set up. Then, you can install the library using `go get`:
 
 ```bash
-go get github.com/slzhffktm/go-http-test
+go get github.com/nicandcranny/go-http-test
 ```
 
 ## Example Usage
@@ -36,7 +36,7 @@ import (
 	"net/http"
 	"testing"
 
-	httptest "github.com/slzhffktm/go-http-test"
+	httptest "github.com/nicandcranny/go-http-test"
 	"github.com/stretchr/testify/assert"
 )
 
