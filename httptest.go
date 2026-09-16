@@ -2,6 +2,7 @@ package httptest
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -46,6 +47,15 @@ type Server struct {
 	calls map[string]map[string]map[string][]RequestMade
 
 	mu sync.Mutex
+
+	// inFlightMu guards inFlight and backs inFlightCond. It is deliberately
+	// separate from mu so that a running handler (which is counted as in-flight)
+	// never blocks route registration/inspection, and vice versa.
+	inFlightMu   sync.Mutex
+	inFlightCond *sync.Cond
+	// inFlight is the number of user handlers currently executing across all
+	// routes. See InFlight and WaitUntilIdle.
+	inFlight int
 }
 
 type Request struct {
@@ -105,6 +115,7 @@ func NewServer(address string, config ServerConfig) (*Server, error) {
 		keyFns:       map[string]map[string]KeyFunc{},
 		calls:        map[string]map[string]map[string][]RequestMade{},
 	}
+	server.inFlightCond = sync.NewCond(&server.inFlightMu)
 
 	go func() {
 		if err = httpServer.Serve(l); err != nil && !errors.Is(err, http.ErrServerClosed) {
@@ -126,6 +137,64 @@ func (s *Server) Close() error {
 // hardcoding (and colliding on) a fixed port.
 func (s *Server) Addr() string {
 	return s.listenerAddr
+}
+
+// enterHandler records that a user handler has started executing.
+func (s *Server) enterHandler() {
+	s.inFlightMu.Lock()
+	s.inFlight++
+	s.inFlightMu.Unlock()
+}
+
+// exitHandler records that a user handler has finished executing and wakes any
+// goroutine waiting in WaitUntilIdle.
+func (s *Server) exitHandler() {
+	s.inFlightMu.Lock()
+	s.inFlight--
+	s.inFlightCond.Broadcast()
+	s.inFlightMu.Unlock()
+}
+
+// InFlight returns the number of request handlers currently executing on the
+// server. It counts only the user handler invocation, not connection setup or
+// call recording. A return value of 0 means no handler is running at the instant
+// of the call (a new request may begin immediately after).
+func (s *Server) InFlight() int {
+	s.inFlightMu.Lock()
+	defer s.inFlightMu.Unlock()
+	return s.inFlight
+}
+
+// WaitUntilIdle blocks until no request handler is executing, or until ctx is
+// done, whichever happens first. It returns nil once the server is idle, or
+// ctx.Err() if the context is cancelled or its deadline passes first.
+//
+// This waits only for the requests already in flight (plus any that begin while
+// waiting) to finish; it does not stop the server from accepting new requests
+// and makes no guarantee about requests that arrive after it returns.
+//
+// It is useful when the system under test calls this mock server from
+// background goroutines that may outlive the synchronous body of a test: wait
+// for those handlers to complete before moving on, so a still-running handler
+// cannot race with the next test's setup.
+func (s *Server) WaitUntilIdle(ctx context.Context) error {
+	// Wake the waiter when ctx is done so it does not block past cancellation.
+	stop := context.AfterFunc(ctx, func() {
+		s.inFlightMu.Lock()
+		s.inFlightCond.Broadcast()
+		s.inFlightMu.Unlock()
+	})
+	defer stop()
+
+	s.inFlightMu.Lock()
+	defer s.inFlightMu.Unlock()
+	for s.inFlight > 0 {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		s.inFlightCond.Wait()
+	}
+	return nil
 }
 
 // GetNCalls returns the number of calls for a path in the default (keyless) bucket.
@@ -280,6 +349,8 @@ func (s *Server) RegisterKeyedRoute(method string, path string, keyFn KeyFunc) {
 
 		// Give the user handler a fresh, full body to read.
 		restoreBody()
+		s.enterHandler()
+		defer s.exitHandler()
 		currHandler(ResponseWriter{w: c.Response().Writer}, req)
 		return nil
 	})

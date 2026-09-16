@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"sync"
 	"testing"
 	"time"
 
@@ -27,6 +28,109 @@ var (
 func newTestClient(baseURL string) *httpclient.HttpClient {
 	c := &http.Client{Timeout: 2 * time.Second}
 	return httpclient.New(baseURL, c)
+}
+
+const inflightAddress = "127.0.0.1:3011"
+const inflightBaseURL = "http://127.0.0.1:3011"
+
+// TestInFlightAndWaitUntilIdle verifies that InFlight reflects a running handler
+// and that WaitUntilIdle blocks until the handler finishes.
+func TestInFlightAndWaitUntilIdle(t *testing.T) {
+	server, err := httptest.NewServer(inflightAddress, httptest.ServerConfig{})
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+	defer server.Close()
+
+	if got := server.InFlight(); got != 0 {
+		t.Fatalf("InFlight before any request = %d, want 0", got)
+	}
+
+	// release lets the handler finish only when the test allows it.
+	release := make(chan struct{})
+	entered := make(chan struct{})
+	server.RegisterHandler(http.MethodGet, "/slow", func(w httptest.ResponseWriter, r *httptest.Request) {
+		close(entered)
+		<-release
+		w.SetStatusCode(http.StatusOK)
+	})
+
+	client := newTestClient(inflightBaseURL)
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		_, _, _ = client.Do(context.Background(), http.MethodGet, "/slow", nil, nil, nil)
+	}()
+
+	// Wait until the handler is actually executing.
+	<-entered
+	if got := server.InFlight(); got != 1 {
+		t.Fatalf("InFlight while handler running = %d, want 1", got)
+	}
+
+	// WaitUntilIdle must NOT return while the handler is still in flight.
+	idleReturned := make(chan error, 1)
+	go func() {
+		idleReturned <- server.WaitUntilIdle(context.Background())
+	}()
+	select {
+	case <-idleReturned:
+		t.Fatal("WaitUntilIdle returned while a handler was still in flight")
+	case <-time.After(100 * time.Millisecond):
+		// expected: still blocking
+	}
+
+	// Let the handler complete; WaitUntilIdle should now return nil.
+	close(release)
+	select {
+	case err := <-idleReturned:
+		if err != nil {
+			t.Fatalf("WaitUntilIdle returned error after idle: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("WaitUntilIdle did not return after the handler finished")
+	}
+
+	wg.Wait()
+	if got := server.InFlight(); got != 0 {
+		t.Fatalf("InFlight after handler finished = %d, want 0", got)
+	}
+}
+
+// TestWaitUntilIdleContextCancelled verifies WaitUntilIdle returns the context
+// error if the handler never finishes within the deadline.
+func TestWaitUntilIdleContextCancelled(t *testing.T) {
+	server, err := httptest.NewServer(inflightAddress, httptest.ServerConfig{})
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+	defer server.Close()
+
+	release := make(chan struct{})
+	entered := make(chan struct{})
+	server.RegisterHandler(http.MethodGet, "/hang", func(w httptest.ResponseWriter, r *httptest.Request) {
+		close(entered)
+		<-release
+	})
+	defer close(release)
+
+	client := newTestClient(inflightBaseURL)
+	go func() { _, _, _ = client.Do(context.Background(), http.MethodGet, "/hang", nil, nil, nil) }()
+
+	<-entered
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	err = server.WaitUntilIdle(ctx)
+	if err == nil {
+		t.Fatal("WaitUntilIdle returned nil, want context deadline error")
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("WaitUntilIdle blocked too long (%s) past the context deadline", elapsed)
+	}
 }
 
 type serverTestSuite struct {

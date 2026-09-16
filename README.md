@@ -1,214 +1,212 @@
-# go-http-test: HTTP Testing Library for Go
+# go-http-test
 
-go-http-test is a library for Go that provides a convenient way to start a new HTTP server at a desired address and enables you to perform various HTTP testing scenarios with ease.
-This library is especially useful for writing unit tests and end-to-end tests for HTTP-based applications in Go.
-This library also supports path parameter using `/:pathparam`.
+`go-http-test` starts a real HTTP server for Go tests. Register mock routes,
+return controlled responses, and inspect the requests your code sent.
 
-## Features
+It supports path parameters, recorded request bodies and headers, parallel-test
+isolation, and dynamically assigned ports.
 
-- Start a new HTTP server at a custom address for testing purposes.
-- Register custom handlers for different paths on the server.
-- Track the number of calls made to specific paths on the server.
-- Reset the call counters for individual paths, facilitating multiple test scenarios.
-- Reregister handler same path will overwrite the previous handler.
-- Reset all function to clear out the calls & handlers.
-- **Two modes**: *simple mode* (one handler per route) for single/sequential
-  tests or endpoint with static response, 
-  and *keyed mode* (per-request buckets) for parallel tests that need a
-  different response per request. See [Modes](#modes) and
-  [Parallel Tests](#parallel-tests-keyed-mode).
+## Install
 
-## Installation
-
-To use go-http-test in your Go projects, you need to have Go (>=1.23) installed and set up. Then, you can install the library using `go get`:
+Requires Go 1.26 or newer.
 
 ```bash
 go get github.com/nicandcranny/go-http-test
 ```
 
-## Modes
+## Quick start
 
-go-http-test can be used in two modes:
-
-- **Simple mode** — one handler per route. Perfect for a single test (or a
-  sequential suite): register a handler, make the request, assert the calls.
-  This is also perfect for static endpoint that always returns the same result
-  in every test.
-  Use `RegisterHandler`, `GetNCalls`, `GetCalls`, `ResetCalls`.
-- **Keyed mode** — one route, many per-request buckets. Use this when you want to
-  **run tests in parallel against the same route and return a different response
-  for different requests**. Each request is routed to a bucket by a key you
-  derive from the request (e.g. a user id, a client id, a channel), so each
-  parallel test owns its own handler and its own recorded calls with no
-  cross-test interference. Use `RegisterKeyedRoute` + `RegisterKeyedHandler`,
-  `GetNCallsByKey`, `GetCallsByKey`, `ResetCallsByKey`.
-
-Simple mode is the shorthand; keyed mode is the parallel-safe path. The simple
-mode methods are just keyed mode with a single default bucket, so you can mix
-both and existing simple-mode code keeps working unchanged.
-
-| Simple mode (single test)      | Keyed mode (parallel-safe)                     |
-|--------------------------------|------------------------------------------------|
-| `RegisterHandler`              | `RegisterKeyedRoute` + `RegisterKeyedHandler`  |
-| `GetNCalls(method, path)`      | `GetNCallsByKey(method, path, key)`            |
-| `GetCalls(method, path)`       | `GetCallsByKey(method, path, key)`             |
-| `ResetCalls()` (all buckets)   | `ResetCallsByKey(method, path, key)`           |
-
-The simple mode methods still work unchanged — they operate on a single default
-bucket (the empty-string key), so existing single-test code needs no changes.
-
-## Example Usage
-
-To see real-life usage examples, check out [/examples](/examples):
-
-- Simple mode: [send_slack_message_test.go](/examples/send_slack_message_test.go)
-- Keyed/parallel mode: [send_slack_message_keyed_test.go](/examples/send_slack_message_keyed_test.go)
-
-### Simple Mode
-
-Here's a short example of how you can use go-http-test to test an HTTP endpoint that returns a predefined response:
+Use port `0` to let the operating system choose an available port. `Addr`
+returns the address selected for the server.
 
 ```go
-package main_test
+package example_test
 
 import (
-	"encoding/json"
-	"io"
 	"net/http"
+	"strings"
 	"testing"
 
-	httptest "github.com/nicandcranny/go-http-test"
-	"github.com/stretchr/testify/assert"
+	mockhttp "github.com/nicandcranny/go-http-test"
 )
 
-func TestExample(t *testing.T) {
-	// Start a new HTTP server using go-http-test
-	server, err := httptest.NewServer("localhost:8080", httptest.ServerConfig{
-		EnableLogging: true, // To enable logging
-	})
-	assert.NoError(t, err)
-	defer server.Close()
-
-	path := "/some-path/:id"
-	expectedResBody := []byte(`{"res":"ponse"}`)
-
-	// You can also return a JSON by using a struct with json tag or map[string]any.
-	type resStruct struct {
-		Abcd string `json:"abcd"`
-		Efgh int    `json:"efgh"`
+func TestCreateUser(t *testing.T) {
+	server, err := mockhttp.NewServer("127.0.0.1:0", mockhttp.ServerConfig{})
+	if err != nil {
+		t.Fatal(err)
 	}
-	server.RegisterHandler(http.MethodPost, path, func(w httptest.ResponseWriter, r *httptest.Request) {
-		// You can do validation for the request here, e.g. request header, body, etc
-		assert.Equal(t, "application/json", r.Header.Get("Content-Type"))
-		assert.Equal(t, "1d", r.Params.ByName("id"))
-
-		reqBodyByte, err := io.ReadAll(r.Body)
-		assert.NoError(t, err)
-		var reqBody map[string]any
-		assert.NoError(t, json.Unmarshal(reqBodyByte, &reqBody))
-		assert.Equal(t, "abcd", reqBody["abcd"])
-
-		// You can also generate different response body based on the request body
-		w.Header().Set("Content-Type", "application/json")
-		w.SetStatusCode(http.StatusOK)
-		w.SetBodyJSON(resStruct{
-			Abcd: reqBody["abcd"],
-			Efgh: 1,
-		})
-
-		// Or you can also send using this method to simplify the code
-		w.JSON(http.StatusOK, resStruct{
-			Abcd: reqBody["abcd"],
-			Efgh: 1,
-		})
-	})
-
-	// Test doing a GET request to the path
-	res, err := http.Get("http://localhost:8080/some-path/1d")
-	assert.NoError(t, err)
-	assert.Equal(t, http.StatusOK, res.StatusCode)
-
-    // Assert total number of call to the path
-	assert.Equal(t, 1, server.GetNCalls(http.MethodGet, path))
-
-	// Reset the call counters back to 0
-	server.ResetNCalls()
-
-	// We can also get the call and assert here.
-	call := server.GetCalls(http.MethodPost, path)[0]
-	assert.Equal(t, "1d", call.Params["1d"])
-}
-```
-
-### Keyed Mode
-
-Keyed mode buckets all per-route state under a **key derived from each request**
-— `map[method][path][key]` — so parallel tests can share a route while each owns
-its own handler, response, and recorded calls.
-
-There are two steps:
-
-1. `RegisterKeyedRoute(method, path, keyFn)` — declare the route **once** (e.g. in
-   suite setup). The `keyFn` extracts the bucket key from each incoming request.
-   The first registration for a `(method, path)` wins; later calls are no-ops, so
-   concurrent setup from parallel tests is safe. The request body is buffered and
-   restored, so reading it inside `keyFn` does not consume it for the handler.
-2. `RegisterKeyedHandler(method, path, key, handler)` — each test registers its
-   own handler under its own key. Registering the same key again overwrites only
-   that key's handler; other keys are untouched.
-
-Reads are per-key (`GetNCallsByKey`, `GetCallsByKey`, `ResetCallsByKey`) and only
-touch that test's bucket. Requests whose key has no registered handler get a
-`404` (the call is still recorded under that key).
-
-```go
-func TestNotifyUsers(t *testing.T) {
-	t.Parallel()
-
-	server, err := httptest.NewServer("127.0.0.1:8080", httptest.ServerConfig{})
-	assert.NoError(t, err)
 	t.Cleanup(func() { _ = server.Close() })
 
-	// Declare the route once. Bucket each request by its "user_id".
-	server.RegisterKeyedRoute(http.MethodPost, "/notify", func(r *httptest.Request) string {
-		body, _ := io.ReadAll(r.Body) // body is buffered & restored for the handler
-		var m map[string]any
-		_ = json.Unmarshal(body, &m)
-		id, _ := m["user_id"].(string)
-		return id
+	const route = "/users/:id"
+	server.RegisterHandler(http.MethodPost, route, func(w mockhttp.ResponseWriter, r *mockhttp.Request) {
+		if got := r.Params.ByName("id"); got != "42" {
+			t.Errorf("id = %q, want 42", got)
+		}
+		_ = w.JSON(http.StatusCreated, map[string]any{"ok": true})
 	})
 
-	for _, userID := range []string{"u-aaa", "u-bbb", "u-ccc"} {
-		userID := userID
-		t.Run(userID, func(t *testing.T) {
-			t.Parallel()
+	res, err := http.Post(
+		"http://"+server.Addr()+"/users/42",
+		"application/json",
+		strings.NewReader(`{"name":"Ada"}`),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
 
-			// Each parallel test owns its own key's handler + response.
-			server.RegisterKeyedHandler(http.MethodPost, "/notify", userID,
-				func(w httptest.ResponseWriter, r *httptest.Request) {
-					w.JSON(http.StatusOK, map[string]string{"user_id": userID})
-				},
-			)
+	if res.StatusCode != http.StatusCreated {
+		t.Fatalf("status = %d, want %d", res.StatusCode, http.StatusCreated)
+	}
 
-			body := []byte(fmt.Sprintf(`{"user_id":%q}`, userID))
-			res, _ := http.Post("http://"+server.Addr()+"/notify", "application/json", bytes.NewReader(body))
-			assert.Equal(t, http.StatusOK, res.StatusCode)
-
-			// Reads are scoped to this test's key only.
-			assert.Equal(t, 1, server.GetNCallsByKey(http.MethodPost, "/notify", userID))
-			calls := server.GetCallsByKey(http.MethodPost, "/notify", userID)
-			assert.Len(t, calls, 1)
-		})
+	calls := server.GetCalls(http.MethodPost, route)
+	if len(calls) != 1 {
+		t.Fatalf("calls = %d, want 1", len(calls))
+	}
+	if got := calls[0].Params["id"]; got != "42" {
+		t.Errorf("recorded id = %q, want 42", got)
 	}
 }
 ```
 
-See [send_slack_message_keyed_test.go](/examples/send_slack_message_keyed_test.go)
-for a runnable example that posts to several Slack channels in parallel, keyed by
-channel, each expecting its own permalink response.
+Handlers receive the standard `*http.Request` through `Request`, plus
+`Params.ByName` for route parameters. Recorded calls contain:
+
+- `Body []byte`
+- `Headers http.Header`
+- `Query url.Values`
+- `Params map[string]string`
+
+## Simple and keyed modes
+
+Choose one mode per route:
+
+| Mode | Use when | Registration | Assertions |
+| --- | --- | --- | --- |
+| Simple | Tests are sequential, or every request gets the same response | `RegisterHandler` | `GetNCalls`, `GetCalls` |
+| Keyed | Parallel tests share a route but need isolated handlers and call logs | `RegisterKeyedRoute`, then `RegisterKeyedHandler` | `GetNCallsByKey`, `GetCallsByKey` |
+
+### Simple mode
+
+`RegisterHandler` assigns one handler to a method and path. Registering the same
+route again replaces its handler. Do not let parallel tests replace a shared
+route's handler; use keyed mode instead.
+
+```go
+server.RegisterHandler(http.MethodGet, "/health", func(w mockhttp.ResponseWriter, _ *mockhttp.Request) {
+	_ = w.String(http.StatusOK, "ok")
+})
+
+count := server.GetNCalls(http.MethodGet, "/health")
+calls := server.GetCalls(http.MethodGet, "/health")
+```
+
+### Keyed mode
+
+Keyed mode gives each request a bucket. Each bucket has its own handler, call
+count, and recorded calls, so parallel tests can share one server and route
+without overwriting each other's state.
+
+Declare the route once during setup. The first registration for a method and
+path defines its key function; later registrations do nothing.
+
+```go
+server.RegisterKeyedRoute(http.MethodPost, "/notify", func(r *mockhttp.Request) string {
+	return r.Header.Get("X-Test-ID")
+})
+```
+
+Each test then registers a handler under a unique key and sends that key with
+its request:
+
+```go
+const key = "test-1"
+
+server.RegisterKeyedHandler(http.MethodPost, "/notify", key,
+	func(w mockhttp.ResponseWriter, _ *mockhttp.Request) {
+		_ = w.NoContent(http.StatusAccepted)
+	},
+)
+
+req, err := http.NewRequest(http.MethodPost, "http://"+server.Addr()+"/notify", nil)
+if err != nil {
+	t.Fatal(err)
+}
+req.Header.Set("X-Test-ID", key)
+
+res, err := http.DefaultClient.Do(req)
+if err != nil {
+	t.Fatal(err)
+}
+defer res.Body.Close()
+
+calls := server.GetCallsByKey(http.MethodPost, "/notify", key)
+```
+
+Requests with no handler for their derived key receive `404 Not Found`, but the
+request is still recorded. A key function may read the request body; the server
+restores it before calling the registered handler.
+
+See the runnable [simple example](/examples/send_slack_message_test.go) and
+[parallel keyed example](/examples/send_slack_message_keyed_test.go).
+
+## Resetting state
+
+| Method | Clears |
+| --- | --- |
+| `ResetNCalls()` | All call counts |
+| `ResetCalls()` | All recorded calls and call counts |
+| `ResetCallsByKey(method, path, key)` | Recorded calls and count for one keyed bucket |
+| `ResetAll()` | Routes, handlers, key functions, recorded calls, and counts |
+
+Reset methods do not wait for active handlers. Use `WaitUntilIdle` first if a
+handler may still be running.
+
+## Waiting for active handlers
+
+`InFlight` returns the number of handlers currently running. `WaitUntilIdle`
+blocks until that number reaches zero or its context ends.
+
+```go
+ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+defer cancel()
+
+if err := server.WaitUntilIdle(ctx); err != nil {
+	t.Fatalf("wait for mock server: %v", err)
+}
+```
+
+`WaitUntilIdle` returns `nil` when the server becomes idle, or `ctx.Err()` if the
+context ends first. It does not stop new requests. If no handler is running when
+called, it returns immediately and does not wait for future requests.
+
+## Response helpers
+
+`ResponseWriter` provides helpers for common test responses:
+
+```go
+w.JSON(http.StatusOK, value)
+w.HTML(http.StatusOK, "<p>ok</p>")
+w.String(http.StatusOK, "ok")
+w.Blob(http.StatusOK, "application/octet-stream", data)
+w.NoContent(http.StatusNoContent)
+```
+
+For custom responses, use `Header`, `SetStatusCode`, `SetBodyJSON`, or
+`SetBodyBytes`.
+
+Set `ServerConfig.EnableLogging` to `true` to log incoming requests.
 
 ## Contributing
 
-go-http-test is an open source project, and we welcome contributions from the community. If you find a bug, have an enhancement in mind, or want to propose a new feature, please open an issue or submit a pull request on the GitHub repository.
+Found a bug, a confusing edge case, or a way to make HTTP tests nicer? Open an
+issue or send a pull request. Small, focused changes are especially welcome.
 
-Happy testing with go-http-test! If you have any questions or need further assistance, feel free to reach out to the project maintainers.
+Before submitting a pull request:
+
+1. Add or update a test for the behavior you changed.
+2. Run `go test ./...`.
+3. Explain what changed and why.
+
+Documentation fixes and new examples count too. If something made you stop and
+scratch your head, improving it will probably help the next person.
