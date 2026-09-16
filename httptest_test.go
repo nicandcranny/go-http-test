@@ -22,6 +22,13 @@ var (
 	ctx = context.Background()
 )
 
+// newTestClient builds an http client helper pointed at baseURL, used by the
+// keyed/parallel tests (which run via t.Run rather than the suite).
+func newTestClient(baseURL string) *httpclient.HttpClient {
+	c := &http.Client{Timeout: 2 * time.Second}
+	return httpclient.New(baseURL, c)
+}
+
 type serverTestSuite struct {
 	suite.Suite
 	httpClient *httpclient.HttpClient

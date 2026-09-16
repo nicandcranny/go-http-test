@@ -14,16 +14,36 @@ import (
 	"github.com/labstack/echo/v4/middleware"
 )
 
+// defaultKey is the bucket key used by the keyless methods (RegisterHandler,
+// GetNCalls, GetCalls, ...). Keyless usage is single-test only: every request
+// to a route lands in this single bucket, so it is NOT safe to share one such
+// route across tests running in parallel.
+//
+// For parallel tests, use the keyed API (RegisterKeyedHandler, GetNCallsByKey,
+// GetCallsByKey, ...) so each test's requests are isolated into their own bucket
+// derived from a per-request unique key (e.g. a merchant id or client id).
+const defaultKey = ""
+
 // Server is a mock http server for testing.
 type Server struct {
-	httpServer *http.Server
-	engine     *echo.Echo
-	config     ServerConfig
-	// nCalls store map[method][path]count
-	nCalls map[string]map[string]int
-	// routes store map[method][path]handler
-	routes map[string]map[string]ServerHandlerFunc
-	calls  map[string]map[string][]RequestMade
+	httpServer   *http.Server
+	engine       *echo.Echo
+	config       ServerConfig
+	listenerAddr string
+
+	// nCalls stores the call count as map[method][path][key]count.
+	nCalls map[string]map[string]map[string]int
+	// handlers stores the registered handler as map[method][path][key]handler.
+	// Each (method, path) has exactly one echo route; that route dispatches to
+	// the per-key handler using the route's keyFn.
+	handlers map[string]map[string]map[string]ServerHandlerFunc
+	// keyFns stores the key extractor per route as map[method][path]keyFn.
+	// The keyFn maps an incoming request to the bucket key that selects the
+	// handler and the call log. Keyless routes use a keyFn that always returns
+	// defaultKey.
+	keyFns map[string]map[string]KeyFunc
+	// calls stores the recorded calls as map[method][path][key]calls.
+	calls map[string]map[string]map[string][]RequestMade
 
 	mu sync.Mutex
 }
@@ -42,6 +62,12 @@ type RequestMade struct {
 
 // ServerHandlerFunc is the interface of the handler function.
 type ServerHandlerFunc func(w ResponseWriter, r *Request)
+
+// KeyFunc derives the bucket key for an incoming request. Requests that return
+// the same key share a handler and a call log. Return a value that is unique
+// per test (e.g. a per-test credential embedded in the request) so parallel
+// tests hitting the same route stay isolated.
+type KeyFunc func(r *Request) string
 
 type ServerConfig struct {
 	EnableLogging bool
@@ -70,12 +96,14 @@ func NewServer(address string, config ServerConfig) (*Server, error) {
 	}
 
 	server := &Server{
-		engine:     e,
-		config:     config,
-		httpServer: httpServer,
-		nCalls:     map[string]map[string]int{},
-		routes:     map[string]map[string]ServerHandlerFunc{},
-		calls:      map[string]map[string][]RequestMade{},
+		engine:       e,
+		config:       config,
+		httpServer:   httpServer,
+		listenerAddr: l.Addr().String(),
+		nCalls:       map[string]map[string]map[string]int{},
+		handlers:     map[string]map[string]map[string]ServerHandlerFunc{},
+		keyFns:       map[string]map[string]KeyFunc{},
+		calls:        map[string]map[string]map[string][]RequestMade{},
 	}
 
 	go func() {
@@ -92,108 +120,237 @@ func (s *Server) Close() error {
 	return s.httpServer.Close()
 }
 
-// GetNCalls returns the number of nCalls for a path.
-func (s *Server) GetNCalls(method, path string) int {
-	calls, ok := s.nCalls[method][path]
-	if !ok {
-		return 0
-	}
-
-	return calls
+// Addr returns the actual network address the server is listening on. This is
+// useful when NewServer was called with a ":0" port so the OS assigns a free
+// port — each parallel test can then spin up its own isolated server without
+// hardcoding (and colliding on) a fixed port.
+func (s *Server) Addr() string {
+	return s.listenerAddr
 }
 
-// ResetNCalls resets the number of nCalls for all paths.
+// GetNCalls returns the number of calls for a path in the default (keyless) bucket.
+// For parallel tests, use GetNCallsByKey.
+func (s *Server) GetNCalls(method, path string) int {
+	return s.GetNCallsByKey(method, path, defaultKey)
+}
+
+// GetNCallsByKey returns the number of calls for a path in the given key bucket.
+func (s *Server) GetNCallsByKey(method, path, key string) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return s.nCalls[method][path][key]
+}
+
+// ResetNCalls resets the number of calls for all paths and all keys.
 func (s *Server) ResetNCalls() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	for path := range s.nCalls {
-		for method := range s.nCalls[path] {
-			s.nCalls[path][method] = 0
+	s.resetNCallsLocked()
+}
+
+// resetNCallsLocked zeroes every call counter. Caller must hold s.mu.
+func (s *Server) resetNCallsLocked() {
+	for method := range s.nCalls {
+		for path := range s.nCalls[method] {
+			for key := range s.nCalls[method][path] {
+				s.nCalls[method][path][key] = 0
+			}
 		}
 	}
 }
 
-// GetCalls returns the calls for a path.
+// GetCalls returns the recorded calls for a path in the default (keyless) bucket.
+// For parallel tests, use GetCallsByKey.
 func (s *Server) GetCalls(method, path string) []RequestMade {
-	return s.calls[method][path]
+	return s.GetCallsByKey(method, path, defaultKey)
 }
 
-// ResetCalls resets the calls & nCalls for all paths.
+// GetCallsByKey returns the recorded calls for a path in the given key bucket.
+func (s *Server) GetCallsByKey(method, path, key string) []RequestMade {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return s.calls[method][path][key]
+}
+
+// ResetCalls resets the calls & nCalls for all paths and all keys.
 // It does not reset the handlers.
 func (s *Server) ResetCalls() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	for path := range s.calls {
-		for method := range s.calls[path] {
-			s.calls[path][method] = []RequestMade{}
+	for method := range s.calls {
+		for path := range s.calls[method] {
+			for key := range s.calls[method][path] {
+				s.calls[method][path][key] = []RequestMade{}
+			}
 		}
 	}
-	// Reset NCalls too. We can't call ResetNCalls() here because it will try to acquire the lock too and cause a deadlock.
-	for path := range s.nCalls {
-		for method := range s.nCalls[path] {
-			s.nCalls[path][method] = 0
-		}
-	}
+	// Reset NCalls too. We can't call ResetNCalls() here because it would try
+	// to acquire the lock again and deadlock.
+	s.resetNCallsLocked()
 }
 
-// RegisterHandler registers handler of a path.
-// Registering same path twice will overwrite the previous handler.
-func (s *Server) RegisterHandler(method string, path string, handler ServerHandlerFunc) {
+// ResetCallsByKey resets the calls & nCalls for a single path/key bucket.
+// It does not reset the handler. Use this to reset just the current test's
+// bucket without touching other parallel tests' state.
+func (s *Server) ResetCallsByKey(method, path, key string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if s.nCalls[method] == nil {
-		s.nCalls[method] = map[string]int{}
+	if _, ok := s.calls[method][path]; ok {
+		s.calls[method][path][key] = []RequestMade{}
 	}
-	if s.routes[method] == nil {
-		s.routes[method] = map[string]ServerHandlerFunc{}
+	if _, ok := s.nCalls[method][path]; ok {
+		s.nCalls[method][path][key] = 0
+	}
+}
+
+// RegisterHandler registers a handler for a path in the default (keyless) bucket.
+// Registering the same path twice overwrites the previous handler.
+//
+// This is single-test only. For tests that run in parallel and share a route,
+// use RegisterKeyedRoute + RegisterKeyedHandler so each test's requests are
+// routed to an isolated bucket.
+func (s *Server) RegisterHandler(method string, path string, handler ServerHandlerFunc) {
+	s.RegisterKeyedRoute(method, path, func(*Request) string { return defaultKey })
+	s.RegisterKeyedHandler(method, path, defaultKey, handler)
+}
+
+// RegisterKeyedRoute declares a route whose incoming requests are bucketed by
+// the key that keyFn derives from each request. Call it once per (method, path)
+// during suite setup, before any parallel tests run.
+//
+// The keyFn is fixed on the first call for a route; later calls are no-ops (so
+// concurrent registrations from parallel tests are safe and agree on how the
+// bucket key is derived). Requests whose keyFn result has no registered handler
+// get a 404.
+//
+// Per-test handlers and responses are then registered against a specific key
+// via RegisterKeyedHandler, and each test reads back only its own bucket via
+// GetNCallsByKey / GetCallsByKey.
+func (s *Server) RegisterKeyedRoute(method string, path string, keyFn KeyFunc) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.ensureRouteMapsLocked(method, path)
+
+	if _, routeExists := s.keyFns[method][path]; routeExists {
+		// Route (and its echo handler) already registered; keep the first keyFn.
+		return
+	}
+	s.keyFns[method][path] = keyFn
+
+	s.engine.Add(method, path, func(c echo.Context) error {
+		// Read the body once up front and buffer it. The keyFn, the call
+		// recorder, and the user handler all need to read the body, so we
+		// restore a fresh reader before each consumer.
+		var rawBody []byte
+		if c.Request().Body != nil {
+			rawBody, _ = io.ReadAll(c.Request().Body)
+		}
+		restoreBody := func() {
+			c.Request().Body = io.NopCloser(bytes.NewReader(rawBody))
+		}
+
+		restoreBody()
+		req := &Request{Request: c.Request(), Params: Params{echoContext: c}}
+
+		s.mu.Lock()
+		routeKeyFn := s.keyFns[method][path]
+		s.mu.Unlock()
+
+		key := routeKeyFn(req)
+
+		s.incrNCalls(method, path, key)
+		s.storeCall(method, path, key, rawBody, c)
+
+		s.mu.Lock()
+		currHandler := s.handlers[method][path][key]
+		s.mu.Unlock()
+
+		if currHandler == nil {
+			// No handler registered for this key. Return 404 so the caller gets
+			// a clear signal that this bucket was never set up, instead of a
+			// nil-deref panic.
+			return c.NoContent(http.StatusNotFound)
+		}
+
+		// Give the user handler a fresh, full body to read.
+		restoreBody()
+		currHandler(ResponseWriter{w: c.Response().Writer}, req)
+		return nil
+	})
+}
+
+// RegisterKeyedHandler registers the handler that serves requests whose derived
+// key equals the given key. The route must already be declared with
+// RegisterKeyedRoute. Registering the same (method, path, key) again overwrites
+// only that key's handler; other keys' handlers are untouched, which is what
+// lets parallel tests each own their own bucket on a shared route.
+func (s *Server) RegisterKeyedHandler(
+	method string,
+	path string,
+	key string,
+	handler ServerHandlerFunc,
+) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.ensureRouteMapsLocked(method, path)
+	s.handlers[method][path][key] = handler
+}
+
+// ensureRouteMapsLocked lazily initializes the nested maps for a route.
+// Caller must hold s.mu.
+func (s *Server) ensureRouteMapsLocked(method, path string) {
+	if s.nCalls[method] == nil {
+		s.nCalls[method] = map[string]map[string]int{}
+	}
+	if s.nCalls[method][path] == nil {
+		s.nCalls[method][path] = map[string]int{}
+	}
+	if s.handlers[method] == nil {
+		s.handlers[method] = map[string]map[string]ServerHandlerFunc{}
+	}
+	if s.handlers[method][path] == nil {
+		s.handlers[method][path] = map[string]ServerHandlerFunc{}
 	}
 	if s.calls[method] == nil {
-		s.calls[method] = map[string][]RequestMade{}
+		s.calls[method] = map[string]map[string][]RequestMade{}
 	}
-
-	_, alreadyRegistered := s.routes[method][path]
-	s.routes[method][path] = handler
-
-	if !alreadyRegistered {
-		s.engine.Add(method, path, func(c echo.Context) error {
-			s.incrNCalls(method, path)
-			s.storeCall(method, path, c)
-
-			s.mu.Lock()
-			currHandler := s.routes[method][path]
-			s.mu.Unlock()
-
-			currHandler(ResponseWriter{w: c.Response().Writer}, &Request{Request: c.Request(), Params: Params{echoContext: c}})
-			return nil
-		})
+	if s.calls[method][path] == nil {
+		s.calls[method][path] = map[string][]RequestMade{}
+	}
+	if s.keyFns[method] == nil {
+		s.keyFns[method] = map[string]KeyFunc{}
 	}
 }
 
-// incrNCalls increments the number of nCalls for a path.
-func (s *Server) incrNCalls(method, path string) {
+// incrNCalls increments the number of calls for a path/key bucket.
+func (s *Server) incrNCalls(method, path, key string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	s.nCalls[method][path]++
+	if s.nCalls[method][path] == nil {
+		s.nCalls[method][path] = map[string]int{}
+	}
+	s.nCalls[method][path][key]++
 }
 
-// storeCall stores the call for a path.
-func (s *Server) storeCall(method, path string, c echo.Context) {
+// storeCall records the call for a path/key bucket. body is the already-read
+// request body (buffered by the route dispatch) so we don't consume the reader
+// the user handler still needs.
+func (s *Server) storeCall(method, path, key string, body []byte, c echo.Context) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	// If body is not empty, read it into byte.
-	var body []byte
-	if c.Request().Body != nil {
-		body, _ = io.ReadAll(c.Request().Body)
-		// Restore the body.
-		c.Request().Body = io.NopCloser(bytes.NewBuffer(body))
+	if s.calls[method][path] == nil {
+		s.calls[method][path] = map[string][]RequestMade{}
 	}
-
-	s.calls[method][path] = append(s.calls[method][path], RequestMade{
+	s.calls[method][path][key] = append(s.calls[method][path][key], RequestMade{
 		Body:    body,
 		Headers: c.Request().Header,
 		Query:   c.QueryParams(),
@@ -216,7 +373,7 @@ func (s *Server) getAllParams(c echo.Context) map[string]string {
 	return params
 }
 
-// ResetAll resets all the nCalls, handlers, and calls.
+// ResetAll resets all the nCalls, handlers, keyFns, and calls.
 func (s *Server) ResetAll() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -231,7 +388,8 @@ func (s *Server) ResetAll() {
 
 	s.httpServer.Handler = s.engine
 
-	s.nCalls = map[string]map[string]int{}
-	s.routes = map[string]map[string]ServerHandlerFunc{}
-	s.calls = map[string]map[string][]RequestMade{}
+	s.nCalls = map[string]map[string]map[string]int{}
+	s.handlers = map[string]map[string]map[string]ServerHandlerFunc{}
+	s.keyFns = map[string]map[string]KeyFunc{}
+	s.calls = map[string]map[string]map[string][]RequestMade{}
 }
